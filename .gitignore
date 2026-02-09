@@ -1,0 +1,12 @@
+﻿*.gpkg
+*.geojson
+*.json
+cache/
+.idea/
+.venv/
+__pycache__/
+*.mps
+*.mst
+*.sol
+*.tif
+.DS_Store
