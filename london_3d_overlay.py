@@ -13,7 +13,7 @@ import json
 
 import numpy as np
 
-from layers_with_divisions import compute_layer_plan
+from layers_with_divisions import compute_layer_plan, optimize_layer_plan
 from fleet_specs import get_l0_cell_m
 import geopandas as gpd
 import osmnx as ox
@@ -210,7 +210,11 @@ def main():
     else:
         R = overlay_data.get("R")
         if R is not None:
-            plan = compute_layer_plan(R_final=R, S0=BOTTOM_LAYER_CELL_M, verbose=True)
+            plan = optimize_layer_plan(
+                R_final=R, S0=BOTTOM_LAYER_CELL_M,
+                layer_spacing_m=100.0, city_radius_m=1000.0,
+                verbose=True,
+            )
             if plan is not None:
                 print(f"Layer plan: {plan.k + 1} layers, divisions={plan.divisions}")
 

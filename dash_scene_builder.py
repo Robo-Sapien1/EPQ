@@ -24,9 +24,10 @@ from scipy.spatial import cKDTree
 
 import plotly.graph_objects as go
 
-from layers_with_divisions import compute_layer_plan
+from layers_with_divisions import compute_layer_plan, optimize_layer_plan
 from fleet_specs import get_l0_cell_m
 from l0_height import compute_l0_node_heights, get_l0_max_z
+from h_function import compute_h_function, region_boundary_segments, _auto_demand_threshold
 
 
 # ------------------ SETTINGS (mirror of dash_drone_sim where needed) ------------------
@@ -124,6 +125,15 @@ def load_pipeline_solution():
     if "R" in data:
         out["R"] = float(data["R"])
     return out
+
+
+def load_demand_density_map():
+    """Load the demand_density_map dict from integrating_step1_output.json."""
+    if not STEP1_JSON.exists():
+        return None
+    with open(STEP1_JSON) as f:
+        data = json.load(f)
+    return data.get("demand_density_map")
 
 
 def load_buildings(center_latlon, radius_m, simplify_tol) -> gpd.GeoDataFrame:
@@ -404,6 +414,7 @@ class Scene:
     N_GRID_LAYERS: int = 1
     TOP_LAYER_Z: float = FLAT_LAYER_Z
     layer_plan: object = None
+    h_result: object = None          # HFunctionResult (demand-driven regions)
     has_overlay: bool = False
     grid_0_idx: int = 3
     base_traces: int = 0
@@ -414,7 +425,7 @@ class Scene:
 
 def _build_scene_from_data(cx, cy, radius_m, overlay_data, layer_plan,
                            G_layers, meta_layers, G, meta, buildings, G_3d, depot,
-                           N_GRID_LAYERS, TOP_LAYER_Z):
+                           N_GRID_LAYERS, TOP_LAYER_Z, h_result=None):
     """Build static trace list and trace indices from already-loaded data."""
     static = []
     # 1) Buildings (3 traces)
@@ -450,10 +461,34 @@ def _build_scene_from_data(cx, cy, radius_m, overlay_data, layer_plan,
             static.append(go.Scatter3d(
                 x=lx, y=ly, z=lz, mode="lines",
                 line=dict(width=5, color=DEPOT_GRID_LINE_COLOUR, dash="dot"),
-                name="Depot → grid", showlegend=True,
+                name="Depot -> grid", showlegend=True,
             ))
         else:
-            static.append(go.Scatter3d(x=[], y=[], z=[], mode="lines", name="Depot → grid", showlegend=False))
+            static.append(go.Scatter3d(x=[], y=[], z=[], mode="lines", name="Depot -> grid", showlegend=False))
+
+    # 2) h-function region overlay on the curved L0 surface
+    if h_result is not None and G_layers:
+        l0_meta = meta_layers[0] if meta_layers else {}
+        l0_z = l0_meta.get("z", BOTTOM_LAYER_Z_M)
+        G_l0 = G_layers[0]  # the L0 graph with per-node z from building clearance
+        boundary_data = region_boundary_segments(
+            h_result, z_fallback=l0_z, G_l0=G_l0, z_offset=2.0,
+        )
+        # Combine all region boundaries into one trace
+        all_xs, all_ys, all_zs = [], [], []
+        for bd in boundary_data:
+            all_xs.extend(bd["xs"])
+            all_ys.extend(bd["ys"])
+            all_zs.extend(bd["zs"])
+        if all_xs:
+            static.append(go.Scatter3d(
+                x=all_xs, y=all_ys, z=all_zs, mode="lines",
+                line=dict(width=4, color="rgb(255, 200, 0)"),
+                opacity=0.9,
+                name="h-function regions",
+                showlegend=True,
+            ))
+
     grid_0_idx = len(static)
     for i, G_layer in enumerate(G_layers):
         layer_color = GRID_LAYER_COLOURS[i % len(GRID_LAYER_COLOURS)] if N_GRID_LAYERS > 1 else None
@@ -502,21 +537,48 @@ def get_scene(use_cache: bool = True) -> Scene:
         cx, cy, radius_m, city_polygon = study
         overlay_data = load_pipeline_solution()
         R = overlay_data.get("R") if overlay_data else None
+
+        # ---- h-function: demand-driven mesh sizing ----
+        density_map = load_demand_density_map()
+        h_result = None
+        h_effective_S0 = BOTTOM_LAYER_CELL_M  # fallback: original L0 cell size
+        if density_map is not None and R is not None:
+            t_h = time.perf_counter()
+            h_threshold = _auto_demand_threshold(density_map, BOTTOM_LAYER_CELL_M, target_n_regions=30)
+            h_result = compute_h_function(
+                density_map, BOTTOM_LAYER_CELL_M, cx, cy, radius_m, h_threshold,
+            )
+            h_effective_S0 = h_result.snapped_cell_m
+            print(f"  h-function done: {len(h_result.regions)} regions, "
+                  f"effective L1 cell = {h_effective_S0:.4g} m "
+                  f"({h_result.snap_n} x {BOTTOM_LAYER_CELL_M} m) "
+                  f"({time.perf_counter() - t_h:.1f}s)")
+
+        # ---- Layer plan: use h-function effective size for upper layers ----
         layer_plan = None
         if R is not None:
-            layer_plan = compute_layer_plan(R_final=R, S0=BOTTOM_LAYER_CELL_M, verbose=False)
+            layer_plan = optimize_layer_plan(
+                R_final=R, S0=h_effective_S0,
+                layer_spacing_m=LAYER_SPACING_M, city_radius_m=radius_m,
+                verbose=True,
+            )
         if layer_plan is not None:
-            layer_sizes = layer_plan.layer_sizes
-            num_layers = len(layer_sizes)
+            # layer_plan.layer_sizes[0] is the h-function effective size (for upper layers)
+            # L0 always uses the original fine BOTTOM_LAYER_CELL_M
+            upper_layer_sizes = layer_plan.layer_sizes  # [h_eff, h_eff*d1, ...]
+
             # Load buildings first so we can set L0 heights from building clearance
             t_b = time.perf_counter()
             buildings = load_buildings_in_polygon(city_polygon, 27700)
             print(f"  buildings: {len(buildings)} ({time.perf_counter() - t_b:.1f}s)")
-            # Build L0 with placeholder z
+
+            # Build L0 with ORIGINAL fine cell size
             t_layer = time.perf_counter()
             z0_placeholder = BOTTOM_LAYER_Z_M
-            G_0, meta_0 = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=layer_sizes[0], z=z0_placeholder)
-            print(f"  grid layer 0 (cell={layer_sizes[0]:.1f}m): {G_0.number_of_nodes()} nodes ({time.perf_counter() - t_layer:.1f}s)")
+            G_0, meta_0 = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=BOTTOM_LAYER_CELL_M, z=z0_placeholder)
+            print(f"  grid layer 0 (cell={BOTTOM_LAYER_CELL_M:.2f}m, original L0): "
+                  f"{G_0.number_of_nodes()} nodes ({time.perf_counter() - t_layer:.1f}s)")
+
             # Set L0 node heights (Method A: base height + per-cell where building intersects)
             if L0_HEIGHT_CLEARANCE_M is not None and L0_HEIGHT_CLEARANCE_M > 0:
                 t_l0 = time.perf_counter()
@@ -530,25 +592,34 @@ def get_scene(use_cache: bool = True) -> Scene:
                     plateau_soften_alpha=L0_PLATEAU_SOFTEN_ALPHA,
                     plateau_soften_radius=L0_PLATEAU_SOFTEN_RADIUS,
                 )
-                print(f"  L0 heights set (Method A, clearance={L0_HEIGHT_CLEARANCE_M}m, smooth={L0_SMOOTH_ITERATIONS}, plateau_soften={L0_PLATEAU_SOFTEN_ITERATIONS} r={L0_PLATEAU_SOFTEN_RADIUS}, max_z={L0_max_z:.1f}m) ({time.perf_counter() - t_l0:.1f}s)")
+                print(f"  L0 heights set (Method A, clearance={L0_HEIGHT_CLEARANCE_M}m, "
+                      f"smooth={L0_SMOOTH_ITERATIONS}, "
+                      f"plateau_soften={L0_PLATEAU_SOFTEN_ITERATIONS} r={L0_PLATEAU_SOFTEN_RADIUS}, "
+                      f"max_z={L0_max_z:.1f}m) ({time.perf_counter() - t_l0:.1f}s)")
             else:
                 L0_max_z = get_l0_max_z(G_0)
+
             G_layers = [G_0]
             meta_layers = [meta_0]
-            # Build upper layers: flat at L0_max_z + 100m, then +100m each
-            for i in range(1, num_layers):
+
+            # Build upper layers from the layer plan (starting from h-function effective size)
+            for i, cell_size in enumerate(upper_layer_sizes):
                 t_layer = time.perf_counter()
-                z_i = L0_max_z + i * LAYER_SPACING_M
-                G_i, meta_i = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=layer_sizes[i], z=z_i)
+                z_i = L0_max_z + (i + 1) * LAYER_SPACING_M
+                G_i, meta_i = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=cell_size, z=z_i)
                 G_layers.append(G_i)
                 meta_layers.append(meta_i)
-                print(f"  grid layer {i} (cell={layer_sizes[i]:.1f}m): {G_i.number_of_nodes()} nodes, z={z_i:.0f}m ({time.perf_counter() - t_layer:.1f}s)")
+                print(f"  grid layer {i + 1} (cell={cell_size:.1f}m): "
+                      f"{G_i.number_of_nodes()} nodes, z={z_i:.0f}m "
+                      f"({time.perf_counter() - t_layer:.1f}s)")
+
             # Use second-from-top as the top layer (drop the current top); demand/depots live on this layer.
             if len(G_layers) >= 2:
                 G_layers = G_layers[:-1]
                 meta_layers = meta_layers[:-1]
             G, meta = G_layers[0], meta_layers[0]
         else:
+            h_result = None
             t_b = time.perf_counter()
             buildings = load_buildings_in_polygon(city_polygon, 27700)
             print(f"  buildings: {len(buildings)} ({time.perf_counter() - t_b:.1f}s)")
@@ -573,6 +644,7 @@ def get_scene(use_cache: bool = True) -> Scene:
         G_layers, meta_layers = [G], [meta]
         overlay_data = None
         layer_plan = None
+        h_result = None
         city_polygon = None
         t_b = time.perf_counter()
         buildings = load_buildings(CENTER_POINT, RADIUS_M, SIMPLIFY_TOL)
@@ -597,6 +669,7 @@ def get_scene(use_cache: bool = True) -> Scene:
         "G_layers": G_layers, "meta_layers": meta_layers,
         "G": G, "meta": meta, "buildings": buildings, "G_3d": G_3d,
         "depot": depot, "N_GRID_LAYERS": N_GRID_LAYERS, "TOP_LAYER_Z": TOP_LAYER_Z,
+        "h_result": h_result,
     }
     static, grid_0_idx, base_traces, has_overlay = _build_scene_from_data(**build_args)
     print(f"  static traces built ({time.perf_counter() - t_traces:.1f}s)")
@@ -624,6 +697,7 @@ def get_scene(use_cache: bool = True) -> Scene:
         N_GRID_LAYERS=N_GRID_LAYERS,
         TOP_LAYER_Z=TOP_LAYER_Z,
         layer_plan=layer_plan,
+        h_result=h_result,
         has_overlay=has_overlay,
         grid_0_idx=grid_0_idx,
         base_traces=base_traces,
