@@ -13,8 +13,8 @@ import json
 
 import numpy as np
 
-from layers_with_divisions import compute_layer_plan, optimize_layer_plan
-from fleet_specs import get_l0_cell_m
+from layers_with_divisions import compute_layer_plan
+from fleet_specs import get_l0_cell_m, get_atomic_unit_m
 import geopandas as gpd
 import osmnx as ox
 import plotly.graph_objects as go
@@ -29,7 +29,8 @@ SOLUTION_JSON = OUTPUT_DIR / "depot_solution_for_overlay.json"
 MAX_BUILDINGS = None  # None = all
 SIMPLIFY_TOL = 3     # metres
 OVERLAY_HEIGHT = 2.0  # height above ground for depot/demand layer (metres)
-# L0 cell size from drone_fleet_specs.json (1.5 × max H&B L/W); fallback 10.0
+# Atomic unit = AirMatrix cell side (largest drone + padding); L0 cell = 4 * atomic
+ATOMIC_UNIT_M = get_atomic_unit_m()
 BOTTOM_LAYER_CELL_M = get_l0_cell_m()
 
 
@@ -210,11 +211,8 @@ def main():
     else:
         R = overlay_data.get("R")
         if R is not None:
-            plan = optimize_layer_plan(
-                R_final=R, S0=BOTTOM_LAYER_CELL_M,
-                layer_spacing_m=100.0, city_radius_m=1000.0,
-                verbose=True,
-            )
+            # R_final = depot radius, S0 = atomic unit (L0 = 4*S0 computed internally)
+            plan = compute_layer_plan(R_final=R, S0=ATOMIC_UNIT_M, verbose=True)
             if plan is not None:
                 print(f"Layer plan: {plan.k + 1} layers, divisions={plan.divisions}")
 

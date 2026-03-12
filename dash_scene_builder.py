@@ -24,8 +24,8 @@ from scipy.spatial import cKDTree
 
 import plotly.graph_objects as go
 
-from layers_with_divisions import compute_layer_plan, optimize_layer_plan
-from fleet_specs import get_l0_cell_m
+from layers_with_divisions import compute_layer_plan, GridManager, Pathfinder, setup_grid
+from fleet_specs import get_l0_cell_m, get_atomic_unit_m, get_drone_dims
 from l0_height import compute_l0_node_heights, get_l0_max_z
 
 
@@ -40,9 +40,10 @@ CENTER_POINT = (51.51861, -0.12583)
 RADIUS_M = 1000.0
 BOTTOM_LAYER_Z_M = 300.0
 LAYER_SPACING_M = 100.0
-# L0 cell size = 1.5 × max(H&B length, H&B width); from drone_fleet_specs.json when available
-BOTTOM_LAYER_CELL_M = get_l0_cell_m()
-GRID_SPACING = get_l0_cell_m()
+# Atomic unit = AirMatrix cell side (largest drone + padding); L0 cell = 4 * atomic
+ATOMIC_UNIT_M = get_atomic_unit_m()
+BOTTOM_LAYER_CELL_M = get_l0_cell_m()    # = 4 * ATOMIC_UNIT_M
+GRID_SPACING = get_l0_cell_m()           # grid spacing for networkx graph = L0 cell
 FLAT_LAYER_Z = BOTTOM_LAYER_Z_M
 SIMPLIFY_TOL = 3.0
 MAX_BUILDINGS_PLOTTED = None
@@ -172,25 +173,53 @@ def load_buildings_in_polygon(city_polygon: Polygon, target_epsg: int = 27700) -
     return gdf
 
 
-def build_grid_graph_in_circle(cx, cy, radius_m, cell_size=None, z=None):
+def build_grid_graph_in_circle(cx, cy, radius_m, cell_size=None, z=None,
+                               full_box_side=None):
+    """
+    Build a NetworkX grid graph.
+
+    If *full_box_side* is given (metres), the grid covers a square of
+    that side length centred on (cx, cy) -- no circular clipping.
+    Otherwise falls back to the original circle-based clipping.
+    """
     spacing = cell_size if cell_size is not None else GRID_SPACING
     layer_z = z if z is not None else FLAT_LAYER_Z
-    effective_radius = radius_m + spacing
-    xmin, ymin = cx - effective_radius, cy - effective_radius
-    xmax, ymax = cx + effective_radius, cy + effective_radius
+
+    if full_box_side is not None:
+        half = full_box_side / 2.0
+        xmin, ymin = cx - half, cy - half
+        xmax, ymax = cx + half, cy + half
+    else:
+        effective_radius = radius_m + spacing
+        xmin, ymin = cx - effective_radius, cy - effective_radius
+        xmax, ymax = cx + effective_radius, cy + effective_radius
+
     nxn = int((xmax - xmin) // spacing) + 1
     nyn = int((ymax - ymin) // spacing) + 1
     G = nx.Graph()
     inside = set()
-    for ix in range(nxn):
-        x = xmin + ix * spacing
-        dx2 = (x - cx) ** 2
-        for iy in range(nyn):
-            y = ymin + iy * spacing
-            if dx2 + (y - cy) ** 2 <= effective_radius ** 2:
+
+    if full_box_side is not None:
+        # Full rectangular grid -- no circular clipping
+        for ix in range(nxn):
+            x = xmin + ix * spacing
+            for iy in range(nyn):
+                y = ymin + iy * spacing
                 nid = (ix, iy)
                 inside.add(nid)
                 G.add_node(nid, x=x, y=y, z=layer_z)
+    else:
+        effective_radius = radius_m + spacing
+        for ix in range(nxn):
+            x = xmin + ix * spacing
+            dx2 = (x - cx) ** 2
+            for iy in range(nyn):
+                y = ymin + iy * spacing
+                if dx2 + (y - cy) ** 2 <= effective_radius ** 2:
+                    nid = (ix, iy)
+                    inside.add(nid)
+                    G.add_node(nid, x=x, y=y, z=layer_z)
+
     for (ix, iy) in inside:
         a = (ix, iy)
         b1, b2 = (ix + 1, iy), (ix, iy + 1)
@@ -410,11 +439,17 @@ class Scene:
     cx: float = 0.0
     cy: float = 0.0
     radius_m: float = RADIUS_M
+    grid_manager: object = None
+    pathfinder: object = None
+    layer_speeds_mps: object = None
+    layer_speed_details: object = None
 
 
 def _build_scene_from_data(cx, cy, radius_m, overlay_data, layer_plan,
                            G_layers, meta_layers, G, meta, buildings, G_3d, depot,
-                           N_GRID_LAYERS, TOP_LAYER_Z):
+                           N_GRID_LAYERS, TOP_LAYER_Z,
+                           grid_manager=None, pathfinder=None,
+                           layer_speeds_mps=None, layer_speed_details=None):
     """Build static trace list and trace indices from already-loaded data."""
     static = []
     # 1) Buildings (3 traces)
@@ -437,23 +472,76 @@ def _build_scene_from_data(cx, cy, radius_m, overlay_data, layer_plan,
             ),
         ))
         depots = overlay_data["chosen_depots"]
+        # --- Depots at GROUND LEVEL (z=0) ---
+        DEPOT_GROUND_Z = 0.0
         static.append(go.Scatter3d(
-            x=depots[:, 0].tolist(), y=depots[:, 1].tolist(), z=[TOP_LAYER_Z] * len(depots),
-            mode="markers", name="Depots (solution)",
+            x=depots[:, 0].tolist(), y=depots[:, 1].tolist(),
+            z=[DEPOT_GROUND_Z] * len(depots),
+            mode="markers", name="Depots (ground)",
             marker=dict(size=10, symbol="diamond", color="crimson"),
         ))
-        G_top = G_layers[-1]
-        lx, ly, lz = depot_link_segments(
-            G_top, depots[:, :2].tolist(), TOP_LAYER_Z, DEPOT_GRID_TOUCH_THRESHOLD_M
-        )
-        if lx:
+        # --- Depot vertical columns (ground -> top layer) + branch lines ---
+        # For each depot, draw:
+        #   1) A vertical pole from z=0 up to the highest layer z
+        #   2) At each layer, a horizontal branch to the nearest grid node
+        col_x, col_y, col_z = [], [], []  # vertical columns
+        br_x, br_y, br_z = [], [], []     # horizontal branches
+        layer_zs = [meta_layers[i].get("z", 0) for i in range(N_GRID_LAYERS)]
+        top_z = max(layer_zs) if layer_zs else TOP_LAYER_Z
+        for (dx, dy) in depots[:, :2].tolist():
+            # Vertical column
+            col_x.extend([dx, dx, None])
+            col_y.extend([dy, dy, None])
+            col_z.extend([DEPOT_GROUND_Z, top_z, None])
+            # Branch lines at each layer: connect to nearest grid EDGE.
+            # For L0 (blanket layer), use the actual node z-values at
+            # the edge endpoints so the branch sits on the blanket
+            # surface rather than floating at the flat meta z.
+            for li, G_layer in enumerate(G_layers):
+                pt, na, nb = nearest_edge_to_depot((dx, dy), G_layer)
+                if pt is None or na is None:
+                    continue
+                dist = math.hypot(dx - pt[0], dy - pt[1])
+                if dist <= 0.5:  # skip if depot sits on the edge
+                    continue
+                # Compute z at the nearest-edge point by interpolating
+                # between the two endpoint z-values.
+                ax = G_layer.nodes[na]["x"]
+                ay = G_layer.nodes[na]["y"]
+                az = G_layer.nodes[na]["z"]
+                bx = G_layer.nodes[nb]["x"]
+                by = G_layer.nodes[nb]["y"]
+                bz = G_layer.nodes[nb]["z"]
+                seg_len2 = (bx - ax) ** 2 + (by - ay) ** 2
+                if seg_len2 > 1e-9:
+                    t = ((pt[0] - ax) * (bx - ax) +
+                         (pt[1] - ay) * (by - ay)) / seg_len2
+                    t = max(0.0, min(1.0, t))
+                else:
+                    t = 0.0
+                edge_z = az + t * (bz - az)
+                br_x.extend([dx, pt[0], None])
+                br_y.extend([dy, pt[1], None])
+                br_z.extend([edge_z, edge_z, None])
+
+        if col_x:
             static.append(go.Scatter3d(
-                x=lx, y=ly, z=lz, mode="lines",
-                line=dict(width=5, color=DEPOT_GRID_LINE_COLOUR, dash="dot"),
+                x=col_x, y=col_y, z=col_z, mode="lines",
+                line=dict(width=4, color="rgba(200,30,30,0.8)"),
+                name="Depot columns", showlegend=True,
+            ))
+        else:
+            static.append(go.Scatter3d(x=[], y=[], z=[], mode="lines",
+                                       name="Depot columns", showlegend=False))
+        if br_x:
+            static.append(go.Scatter3d(
+                x=br_x, y=br_y, z=br_z, mode="lines",
+                line=dict(width=3, color="red"),
                 name="Depot → grid", showlegend=True,
             ))
         else:
-            static.append(go.Scatter3d(x=[], y=[], z=[], mode="lines", name="Depot → grid", showlegend=False))
+            static.append(go.Scatter3d(x=[], y=[], z=[], mode="lines",
+                                       name="Depot → grid", showlegend=False))
     grid_0_idx = len(static)
     for i, G_layer in enumerate(G_layers):
         layer_color = GRID_LAYER_COLOURS[i % len(GRID_LAYER_COLOURS)] if N_GRID_LAYERS > 1 else None
@@ -480,6 +568,10 @@ def get_scene(use_cache: bool = True) -> Scene:
             import pickle
             with open(CACHE_PATH, "rb") as f:
                 data = pickle.load(f)
+            # Recreate Pathfinder from cached GridManager (not stored in cache)
+            cached_gm = data.get("grid_manager")
+            if cached_gm is not None and "pathfinder" not in data:
+                data["pathfinder"] = Pathfinder(cached_gm)
             static, grid_0_idx, base_traces, has_overlay = _build_scene_from_data(**data)
             print("[scene] Loaded from cache:", CACHE_PATH)
             return Scene(
@@ -496,6 +588,7 @@ def get_scene(use_cache: bool = True) -> Scene:
     import time
     t0 = time.perf_counter()
     print("[scene] Building from scratch (no cache)...")
+    layer_speeds_mps, layer_speed_details = None, None
     study = load_pipeline_study_area()
     if study is not None:
         print(f"  study area loaded ({time.perf_counter() - t0:.1f}s)")
@@ -504,11 +597,9 @@ def get_scene(use_cache: bool = True) -> Scene:
         R = overlay_data.get("R") if overlay_data else None
         layer_plan = None
         if R is not None:
-            layer_plan = optimize_layer_plan(
-                R_final=R, S0=BOTTOM_LAYER_CELL_M,
-                layer_spacing_m=LAYER_SPACING_M, city_radius_m=radius_m,
-                verbose=True,
-            )
+            # R_final = depot service radius, S0 = atomic unit (padded drone footprint)
+            # compute_layer_plan internally computes L0 = 4 * S0
+            layer_plan = compute_layer_plan(R_final=R, S0=ATOMIC_UNIT_M, verbose=False)
         if layer_plan is not None:
             layer_sizes = layer_plan.layer_sizes
             num_layers = len(layer_sizes)
@@ -516,11 +607,25 @@ def get_scene(use_cache: bool = True) -> Scene:
             t_b = time.perf_counter()
             buildings = load_buildings_in_polygon(city_polygon, 27700)
             print(f"  buildings: {len(buildings)} ({time.perf_counter() - t_b:.1f}s)")
+            # Compute the full bounding-box side so ALL grids cover the
+            # entire simulation area (not just a circle).  This ensures
+            # depot branch-lines always reach a grid node at every layer.
+            _n_l0_raw = math.ceil((2.0 * R) / layer_sizes[0])
+            def _npow2(n):
+                n -= 1
+                n |= n >> 1; n |= n >> 2; n |= n >> 4
+                n |= n >> 8; n |= n >> 16
+                return n + 1
+            bbox_side = float(_npow2(_n_l0_raw)) * layer_sizes[0]
+
             # Build L0 with placeholder z
             t_layer = time.perf_counter()
             z0_placeholder = BOTTOM_LAYER_Z_M
-            G_0, meta_0 = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=layer_sizes[0], z=z0_placeholder)
-            print(f"  grid layer 0 (cell={layer_sizes[0]:.1f}m): {G_0.number_of_nodes()} nodes ({time.perf_counter() - t_layer:.1f}s)")
+            G_0, meta_0 = build_grid_graph_in_circle(
+                cx, cy, radius_m, cell_size=layer_sizes[0], z=z0_placeholder,
+                full_box_side=bbox_side,
+            )
+            print(f"  grid layer 0 (cell={layer_sizes[0]:.1f}m): {G_0.number_of_nodes()} nodes, bbox={bbox_side:.0f}m ({time.perf_counter() - t_layer:.1f}s)")
             # Set L0 node heights (Method A: base height + per-cell where building intersects)
             if L0_HEIGHT_CLEARANCE_M is not None and L0_HEIGHT_CLEARANCE_M > 0:
                 t_l0 = time.perf_counter()
@@ -537,17 +642,60 @@ def get_scene(use_cache: bool = True) -> Scene:
                 print(f"  L0 heights set (Method A, clearance={L0_HEIGHT_CLEARANCE_M}m, smooth={L0_SMOOTH_ITERATIONS}, plateau_soften={L0_PLATEAU_SOFTEN_ITERATIONS} r={L0_PLATEAU_SOFTEN_RADIUS}, max_z={L0_max_z:.1f}m) ({time.perf_counter() - t_l0:.1f}s)")
             else:
                 L0_max_z = get_l0_max_z(G_0)
+            # Update L0 meta z to reflect the actual blanket height
+            meta_0["z"] = L0_max_z
             G_layers = [G_0]
             meta_layers = [meta_0]
             # Build upper layers: flat at L0_max_z + 100m, then +100m each
             for i in range(1, num_layers):
                 t_layer = time.perf_counter()
                 z_i = L0_max_z + i * LAYER_SPACING_M
-                G_i, meta_i = build_grid_graph_in_circle(cx, cy, radius_m, cell_size=layer_sizes[i], z=z_i)
+                G_i, meta_i = build_grid_graph_in_circle(
+                    cx, cy, radius_m, cell_size=layer_sizes[i], z=z_i,
+                    full_box_side=bbox_side,
+                )
                 G_layers.append(G_i)
                 meta_layers.append(meta_i)
                 print(f"  grid layer {i} (cell={layer_sizes[i]:.1f}m): {G_i.number_of_nodes()} nodes, z={z_i:.0f}m ({time.perf_counter() - t_layer:.1f}s)")
+            # All layers are kept — the actual top layer is the coarsest.
+            # Demand/depots live on the top layer.  (Old code dropped the
+            # top and used second-from-top; that workaround is removed.)
             G, meta = G_layers[0], meta_layers[0]
+
+            # -- Build GridManager (full_box) for the Pathfinder --
+            # CRITICAL: use the SAME altitudes as the NetworkX visual grids
+            # so that drone paths align with the drawn layers.
+            # L0 is at L0_max_z (the blanket height); upper layers at
+            # L0_max_z + i * LAYER_SPACING_M  (same formula as the
+            # build_grid_graph_in_circle calls above).
+            gm_layer_altitudes = [L0_max_z + i * LAYER_SPACING_M
+                                  for i in range(num_layers)]
+            t_gm = time.perf_counter()
+            gm = setup_grid(
+                depot_radius=R,
+                atomic_unit_size=ATOMIC_UNIT_M,
+                centre_x=cx, centre_y=cy,
+                full_box=True,
+                layer_altitudes=gm_layer_altitudes,
+                verbose=False,
+            )
+            pf = Pathfinder(gm)
+            print(f"  GridManager (full_box) + Pathfinder built "
+                  f"({sum(l.total_cells for l in gm.layers):,} cells, "
+                  f"altitudes={[f'{z:.0f}' for z in gm_layer_altitudes]}) "
+                  f"({time.perf_counter() - t_gm:.1f}s)")
+
+            # --- Compute per-layer speeds (post-construction) ---
+            # Uses CORRIDRONE tradeoff: faster -> bigger geofence -> lower packing capacity.
+            speed_report = gm.compute_layer_speeds_mps(
+                get_drone_dims("H&B"),
+                traffic_intensity=0.7,
+                edge_traversal_time_low_s=6.0,
+                edge_traversal_time_high_s=2.0,
+                speed_cap_mps=23.0,
+            )
+            layer_speeds_mps = speed_report.get("speeds_mps")
+            layer_speed_details = speed_report.get("details")
         else:
             t_b = time.perf_counter()
             buildings = load_buildings_in_polygon(city_polygon, 27700)
@@ -565,6 +713,8 @@ def get_scene(use_cache: bool = True) -> Scene:
                     plateau_soften_radius=L0_PLATEAU_SOFTEN_RADIUS,
                 )
             G_layers, meta_layers = [G], [meta]
+            gm, pf = None, None
+            layer_speeds_mps, layer_speed_details = None, None
     else:
         print("  using default circle (no pipeline JSONs)")
         cx, cy = center_point_27700()
@@ -574,6 +724,8 @@ def get_scene(use_cache: bool = True) -> Scene:
         overlay_data = None
         layer_plan = None
         city_polygon = None
+        gm, pf = None, None
+        layer_speeds_mps, layer_speed_details = None, None
         t_b = time.perf_counter()
         buildings = load_buildings(CENTER_POINT, RADIUS_M, SIMPLIFY_TOL)
         print(f"  buildings: {len(buildings)} ({time.perf_counter() - t_b:.1f}s)")
@@ -597,6 +749,9 @@ def get_scene(use_cache: bool = True) -> Scene:
         "G_layers": G_layers, "meta_layers": meta_layers,
         "G": G, "meta": meta, "buildings": buildings, "G_3d": G_3d,
         "depot": depot, "N_GRID_LAYERS": N_GRID_LAYERS, "TOP_LAYER_Z": TOP_LAYER_Z,
+        "grid_manager": gm, "pathfinder": pf,
+        "layer_speeds_mps": layer_speeds_mps,
+        "layer_speed_details": layer_speed_details,
     }
     static, grid_0_idx, base_traces, has_overlay = _build_scene_from_data(**build_args)
     print(f"  static traces built ({time.perf_counter() - t_traces:.1f}s)")
@@ -605,8 +760,10 @@ def get_scene(use_cache: bool = True) -> Scene:
     if use_cache and cache_dir.exists():
         try:
             import pickle
+            # Cache build_args minus non-picklable pathfinder (it's cheap to recreate)
+            cache_args = {k: v for k, v in build_args.items() if k not in ("pathfinder",)}
             with open(CACHE_PATH, "wb") as f:
-                pickle.dump(build_args, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(cache_args, f, protocol=pickle.HIGHEST_PROTOCOL)
             print("[scene] Cached to", CACHE_PATH)
         except Exception as e:
             print("[scene] Cache write failed:", e)
@@ -628,4 +785,7 @@ def get_scene(use_cache: bool = True) -> Scene:
         grid_0_idx=grid_0_idx,
         base_traces=base_traces,
         cx=cx, cy=cy, radius_m=radius_m,
+        grid_manager=gm, pathfinder=pf,
+        layer_speeds_mps=layer_speeds_mps,
+        layer_speed_details=layer_speed_details,
     )

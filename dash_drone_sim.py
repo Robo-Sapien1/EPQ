@@ -20,22 +20,25 @@ from fleet_specs import get_l0_cell_m, get_drone_dims
 
 # ------------------ SETTINGS (sim + UI only) ------------------
 
+
+
 TICK_MS = 300   # tick interval; slightly higher reduces callback load
 MAX_DRONE_SLOTS = 80
-N_DRONES = 3
+N_DRONES = 25   # concurrent drones (non-overlay); more = busier sky
 BASE_STEP_M = 3.0
 RNG_SEED = 123
 # Collision avoidance: set False to deactivate SAFE_SEP and segment-crossing checks (drones ignore each other)
 COLLISIONS_ENABLED = False
 SAFE_SEP_M = 2.5
-DELIVERY_SPAWN_TICKS_MIN = 4
+DELIVERY_SPAWN_TICKS_MIN = 1   # spawn more often (min ticks between spawn events)
 # Scale factor for drawn drone box so they stay visible when not zoomed in (sim logic unchanged)
 DRONE_DISPLAY_SCALE = 4.0
-DELIVERY_SPAWN_TICKS_MAX = 20
+DELIVERY_SPAWN_TICKS_MAX = 6   # spawn more often (max ticks between spawn events)
+SPAWN_BATCH_SIZE = 5   # overlay mode: how many new drones to add per spawn event
 # Use Euclidean distance to pick depot (fast, no lag). Set True for path-length-based choice (accurate but laggy on spawn).
 USE_PATH_BASED_DEPOT = False
-# L0 cell size from drone_fleet_specs.json (1.5 × max H&B L/W); fallback 15.0
-GRID_SPACING = get_l0_cell_m(fallback_m=15.0)
+# L0 cell size = 4 * atomic_unit (from fleet specs)
+GRID_SPACING = get_l0_cell_m()
 LAYER_SPACING_M = 100.0
 DRONE_TYPES = ["Standard", "Oversize", "H&B"]
 
@@ -58,6 +61,8 @@ depot = scene.depot
 N_GRID_LAYERS = scene.N_GRID_LAYERS
 TOP_LAYER_Z = scene.TOP_LAYER_Z
 layer_plan = scene.layer_plan
+grid_manager = scene.grid_manager
+pathfinder = scene.pathfinder
 
 rng = random.Random(RNG_SEED)
 
@@ -238,6 +243,31 @@ def nearest_depot_idx(depots_xy, x, y):
 
 
 def nearest_depot_idx_by_path(depots_xy, delivery_xy):
+    """Pick the depot whose hierarchical path to the delivery point is shortest."""
+    # Fast path via Pathfinder (hierarchical grid)
+    if pathfinder is not None:
+        dx, dy = delivery_xy
+        best_i, best_len = 0, float("inf")
+        for i, (dep_x, dep_y) in enumerate(depots_xy):
+            try:
+                result = pathfinder.get_path(
+                    start_xy=(float(dep_x), float(dep_y)),
+                    target_xy=(float(dx), float(dy)),
+                    step_m=30.0,  # coarse interpolation for speed
+                )
+                # Approximate path length from positions
+                positions = result["positions"]
+                path_len = sum(
+                    math.hypot(positions[k+1][0]-positions[k][0],
+                               positions[k+1][1]-positions[k][1])
+                    for k in range(len(positions)-1)
+                )
+                if path_len < best_len:
+                    best_len, best_i = path_len, i
+            except Exception:
+                continue
+        return best_i
+
     if G_3d is None or N_GRID_LAYERS == 0:
         return nearest_depot_idx(depots_xy, delivery_xy[0], delivery_xy[1])
     dx, dy = delivery_xy
@@ -273,24 +303,66 @@ def nearest_depot_idx_by_path(depots_xy, delivery_xy):
     return best_i
 
 
+def _nearest_edge_on_layer(depot_xy, G_layer):
+    """Return (point_on_edge, node_a, node_b) for the grid edge on
+    *G_layer* closest to *depot_xy*.  Same as nearest_edge_to_depot."""
+    return nearest_edge_to_depot(depot_xy, G_layer)
+
+
 def new_mission_3d(delivery_xy, depot_xy, start_tick=0):
-    if G_3d is None or N_GRID_LAYERS == 0:
-        return new_mission(start_tick=start_tick)
+    """
+    Create a drone mission using the new hierarchical flight profile
+    but routing through the **NetworkX G_3d graph** (nodes & edges).
+
+    Flight profile:
+        1. Launch from depot at ground level (z=0)
+        2. Select cruise layer using energy-optimal heuristic
+        3. Climb vertically to that layer's altitude
+        4. Branch: straight line to the nearest grid edge on that layer
+        5. A* through G_3d (along edges/nodes, stepping down layers)
+        6. STOP at the nearest L0 node to the delivery point
+
+    No "final approach" or landing is generated -- the path ends at
+    the L0 grid node.
+    """
     dx, dy = delivery_xy
     dep_x, dep_y = float(depot_xy[0]), float(depot_xy[1])
-    G_top = G_layers[-1]
-    point_on_edge, node_a, node_b = nearest_edge_to_depot((dep_x, dep_y), G_top)
+
+    if G_3d is None or N_GRID_LAYERS == 0:
+        return new_mission(start_tick=start_tick)
+
+    # -- Step 1: select cruise layer (energy break-even: L1 only if trip >= ~500 m) --
+    from layers_with_divisions import select_cruise_layer
+    trip_dist = math.hypot(dx - dep_x, dy - dep_y)
+    if grid_manager is not None:
+        cruise_li = select_cruise_layer(grid_manager, trip_dist)
+    else:
+        cruise_li = N_GRID_LAYERS - 1  # fallback: top layer
+    # Clamp to available layers (L0 is allowed for short trips)
+    cruise_li = max(0, min(cruise_li, N_GRID_LAYERS - 1))
+    G_cruise = G_layers[cruise_li]
+    cruise_z = scene.meta_layers[cruise_li].get("z", TOP_LAYER_Z)
+
+    # -- Step 2: find entry point (nearest edge on cruise layer) --
+    point_on_edge, node_a, node_b = _nearest_edge_on_layer(
+        (dep_x, dep_y), G_cruise
+    )
     if point_on_edge is None:
         return new_mission(start_tick=start_tick)
+
+    # -- Step 3: find goal (nearest L0 node to delivery) --
     goal_3d, _ = nearest_node_3d(G_3d, dx, dy, layer=0)
     if goal_3d is None:
         return new_mission(start_tick=start_tick)
-    # Use the edge endpoint that gives the shortest total path to the goal (avoids going to wrong corner then backtracking).
-    leg_depot_to_edge = math.hypot(dep_x - point_on_edge[0], dep_y - point_on_edge[1])
+
+    # -- Step 4: pick best entry node (whichever edge endpoint gives
+    #    the shortest total path to goal) --
     best_start_node = None
     best_total = float("inf")
     for node in (node_a, node_b):
-        start_3d = (N_GRID_LAYERS - 1, node)
+        start_3d = (cruise_li, node)
+        if start_3d not in G_3d.nodes:
+            continue
         leg_edge_to_node = math.hypot(
             point_on_edge[0] - G_3d.nodes[start_3d]["x"],
             point_on_edge[1] - G_3d.nodes[start_3d]["y"],
@@ -303,29 +375,63 @@ def new_mission_3d(delivery_xy, depot_xy, start_tick=0):
             G_3d.edges[path_3d[k], path_3d[k + 1]].get("weight", LAYER_SPACING_M)
             for k in range(len(path_3d) - 1)
         )
-        total = leg_depot_to_edge + leg_edge_to_node + path_len
+        total = leg_edge_to_node + path_len
         if total < best_total:
             best_total, best_start_node = total, node
+
     if best_start_node is None:
         return new_mission(start_tick=start_tick)
-    start_3d = (N_GRID_LAYERS - 1, best_start_node)
+
+    # -- Step 5: build the full path --
+    start_3d = (cruise_li, best_start_node)
     try:
         path_3d = astar_path_3d(G_3d, start_3d, goal_3d)
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return new_mission(start_tick=start_tick)
-    path_positions = path_positions_xyz_3d(G_3d, path_3d, BASE_STEP_M)
-    depot_start = (dep_x, dep_y, TOP_LAYER_Z)
-    point_on_edge_3d = (point_on_edge[0], point_on_edge[1], TOP_LAYER_Z)
-    straight_leg = interpolate_segment_3d(depot_start, point_on_edge_3d, BASE_STEP_M)
-    positions = [depot_start] + straight_leg + path_positions
-    # Precompute route lists for fast patching (no list comp every tick)
+
+    # Determine the actual z at the grid entry point.
+    # For flat layers (L1+) this equals cruise_z.  For L0 (the blanket)
+    # each node has its own z, so we interpolate between the edge
+    # endpoints to get the exact z where the branch meets the grid.
+    entry_nd = G_3d.nodes[start_3d]
+    entry_node_z = entry_nd["z"]
+    # Interpolate edge z at the closest-point position
+    ax = G_cruise.nodes[node_a]["x"]
+    ay = G_cruise.nodes[node_a]["y"]
+    az = G_cruise.nodes[node_a]["z"]
+    bx = G_cruise.nodes[node_b]["x"]
+    by = G_cruise.nodes[node_b]["y"]
+    bz = G_cruise.nodes[node_b]["z"]
+    seg_len2 = (bx - ax) ** 2 + (by - ay) ** 2
+    if seg_len2 > 1e-9:
+        t = ((point_on_edge[0] - ax) * (bx - ax) +
+             (point_on_edge[1] - ay) * (by - ay)) / seg_len2
+        t = max(0.0, min(1.0, t))
+    else:
+        t = 0.0
+    edge_z = az + t * (bz - az)
+
+    # Segment A: ground -> entry altitude (vertical climb)
+    depot_ground = (dep_x, dep_y, 0.0)
+    depot_climb_top = (dep_x, dep_y, edge_z)
+    climb_seg = interpolate_segment_3d(depot_ground, depot_climb_top, BASE_STEP_M)
+
+    # Segment B: branch to the grid edge point (at the edge's z)
+    edge_point_3d = (point_on_edge[0], point_on_edge[1], edge_z)
+    branch_seg = interpolate_segment_3d(depot_climb_top, edge_point_3d, BASE_STEP_M)
+
+    # Segment C: A* path along G_3d nodes/edges
+    grid_positions = path_positions_xyz_3d(G_3d, path_3d, BASE_STEP_M)
+
+    # Assemble full path
+    positions = [depot_ground] + climb_seg + branch_seg + grid_positions
     route_x = [p[0] for p in positions]
     route_y = [p[1] for p in positions]
     route_z = [p[2] for p in positions]
     return {
         "delivery_xy": (dx, dy),
         "drone_type": rng.choice(DRONE_TYPES),
-        "path_nodes": [path_3d[0][1]],
+        "path_nodes": [],
         "path_3d": path_3d,
         "positions": positions,
         "route_x": route_x,
@@ -333,6 +439,7 @@ def new_mission_3d(delivery_xy, depot_xy, start_tick=0):
         "route_z": route_z,
         "pos_i": 0,
         "start_tick": int(start_tick),
+        "cruise_layer": cruise_li,
     }
 
 
@@ -365,8 +472,10 @@ def new_mission(start_tick=0):
 
 
 def drone_idle_at_depot(depot_xy):
+    """Idle drone sitting at depot on the ground (z=0)."""
     x, y = depot_xy[0], depot_xy[1]
-    pos = (float(x), float(y), TOP_LAYER_Z)
+    GROUND_Z = 0.0
+    pos = (float(x), float(y), GROUND_Z)
     return {
         "delivery_xy": None,
         "drone_type": "Standard",
@@ -376,7 +485,7 @@ def drone_idle_at_depot(depot_xy):
         "positions": [pos],
         "route_x": [x, x],
         "route_y": [y, y],
-        "route_z": [TOP_LAYER_Z, TOP_LAYER_Z],
+        "route_z": [GROUND_Z, GROUND_Z],
         "pos_i": 0,
         "start_tick": 0,
     }
@@ -443,6 +552,7 @@ def make_figure(sim_state):
         fig.add_trace(tr)
     drones_list = sim_state.get("drones", [])
     for i in range(MAX_DRONE_SLOTS):
+        d = None
         if i >= len(drones_list):
             rx, ry, rz = EMPTY_ROUTE
             dx, dy = _nan, _nan
@@ -477,8 +587,12 @@ def make_figure(sim_state):
             x=rx, y=ry, z=rz, mode="lines",
             line=dict(width=6, color=path_color), opacity=0.9, showlegend=False,
         ))
+        # Delivery marker: at the z of the path's final waypoint (L0 cell)
+        delivery_z = FLAT_LAYER_Z + 2
+        if d is not None and d.get("positions"):
+            delivery_z = d["positions"][-1][2] + 2
         fig.add_trace(go.Scatter3d(
-            x=[dx], y=[dy], z=[FLAT_LAYER_Z + 2],
+            x=[dx], y=[dy], z=[delivery_z],
             mode="markers", marker=dict(size=9, symbol="x"), showlegend=False,
         ))
         fig.add_trace(go.Scatter3d(
@@ -608,15 +722,17 @@ def tick(n, sim_state, speed):
         ticks_until = sim_state.get("ticks_until_spawn", DELIVERY_SPAWN_TICKS_MIN)
         ticks_until -= 1
         if ticks_until <= 0:
-            dx, dy = random_point_in_circle(rng, meta["cx"], meta["cy"], meta["radius"])
             depots_xy = overlay_data["chosen_depots"]
-            depot_idx = (
-                nearest_depot_idx_by_path(depots_xy, (dx, dy))
-                if USE_PATH_BASED_DEPOT
-                else nearest_depot_idx(depots_xy, dx, dy)
-            )
-            depot_xy = (float(depots_xy[depot_idx][0]), float(depots_xy[depot_idx][1]))
-            if len(drones_list) < MAX_DRONE_SLOTS:
+            for _ in range(SPAWN_BATCH_SIZE):
+                if len(drones_list) >= MAX_DRONE_SLOTS:
+                    break
+                dx, dy = random_point_in_circle(rng, meta["cx"], meta["cy"], meta["radius"])
+                depot_idx = (
+                    nearest_depot_idx_by_path(depots_xy, (dx, dy))
+                    if USE_PATH_BASED_DEPOT
+                    else nearest_depot_idx(depots_xy, dx, dy)
+                )
+                depot_xy = (float(depots_xy[depot_idx][0]), float(depots_xy[depot_idx][1]))
                 drones_list.append(new_mission_3d((float(dx), float(dy)), depot_xy, start_tick=sim_tick))
             ticks_until = rng.randint(DELIVERY_SPAWN_TICKS_MIN, DELIVERY_SPAWN_TICKS_MAX)
         sim_state["ticks_until_spawn"] = ticks_until
@@ -656,9 +772,11 @@ def tick(n, sim_state, speed):
                     patch["data"][route_idx(i)]["y"] = [G.nodes[n]["y"] for n in path_nodes]
                     patch["data"][route_idx(i)]["z"] = [G.nodes[n]["z"] for n in path_nodes]
             dx, dy = d.get("delivery_xy") or d.get("depot_xy", (0, 0))
+            # Delivery marker z: at the path's final waypoint altitude (L0 cell centre)
+            final_z = d["positions"][-1][2] + 2 if d.get("positions") else FLAT_LAYER_Z + 2
             patch["data"][delivery_idx(i)]["x"] = [dx]
             patch["data"][delivery_idx(i)]["y"] = [dy]
-            patch["data"][delivery_idx(i)]["z"] = [FLAT_LAYER_Z + 2]
+            patch["data"][delivery_idx(i)]["z"] = [final_z]
             pi = min(d["pos_i"], len(d["positions"]) - 1)
             x, y, z = d["positions"][pi]
             L, W, H = get_drone_dims(d.get("drone_type") or "Standard")
@@ -674,12 +792,21 @@ def _print_init_once(debug=True):
     if debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         return
     if layer_plan is not None:
-        print(f"Pipeline: {N_GRID_LAYERS} sky layers (bottom 300m, +100m), buildings in polygon")
+        print(f"Pipeline: {N_GRID_LAYERS} sky layers, buildings in polygon")
         print("  Layer plan: number of layers =", N_GRID_LAYERS)
         print("  Cell size (m) per layer:", [round(s, 2) for s in layer_plan.layer_sizes])
     else:
         print("Fallback: center+radius, single grid layer")
     print("Grid nodes (bottom layer):", G.number_of_nodes(), "Grid edges:", G.number_of_edges())
+    if grid_manager is not None:
+        gm = grid_manager
+        print(f"GridManager (full_box): {len(gm.layers)} layers, "
+              f"{sum(l.total_cells for l in gm.layers):,} cells")
+        for layer in gm.layers:
+            print(f"  L{layer.index}: cell={layer.cell_size:.1f}m, "
+                  f"z={layer.z_base:.0f}m, nodes={layer.total_cells:,}")
+    if pathfinder is not None:
+        print("Pathfinder: hierarchical flight profile (climb->branch->cruise->L0 stop)")
 
 
 server = app.server

@@ -6,7 +6,7 @@ import time
 
 # ------------------ 1. SETTINGS ------------------
 
-CENTRE_POINT=(51.51861, -0.12583)
+CENTRE_POINT=(51.484576, -0.177346)
 
 
 RADIUS_M = 1000

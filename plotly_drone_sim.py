@@ -16,8 +16,8 @@ from fleet_specs import get_l0_cell_m
 
 CENTER_POINT = (51.51861, -0.12583)  # (lat, lon)
 RADIUS_M = 5000.0                    # simulation radius circle
-# L0 cell size from drone_fleet_specs.json (1.5 × max H&B L/W); fallback 15.0
-GRID_SPACING = get_l0_cell_m(fallback_m=15.0)
+# L0 cell size from drone_fleet_specs.json (4 × atomic unit)
+GRID_SPACING = get_l0_cell_m()
 FLAT_LAYER_Z = 200.0
 
 # Buildings (visual only)
